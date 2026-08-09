@@ -1,0 +1,59 @@
+name: Sync Google OIDC JWKS
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-google-oidc-jwks
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch and validate Google JWKS
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --retry 3 --retry-all-errors \
+            --proto '=https' --tlsv1.2 \
+            https://www.googleapis.com/oauth2/v3/certs \
+            --output /tmp/google-jwks.json
+          node <<'NODE'
+          const fs = require('fs')
+          const source = JSON.parse(fs.readFileSync('/tmp/google-jwks.json', 'utf8'))
+          if (!Array.isArray(source.keys) || source.keys.length < 1 || source.keys.length > 10) {
+            throw new Error('Unexpected Google JWKS key count')
+          }
+          for (const key of source.keys) {
+            if (key.kty !== 'RSA' || key.alg !== 'RS256' || key.use !== 'sig') {
+              throw new Error('Unexpected Google JWKS key type')
+            }
+            for (const field of ['kid', 'n', 'e']) {
+              if (typeof key[field] !== 'string' || !key[field]) throw new Error(`Missing JWK field: ${field}`)
+            }
+            for (const privateField of ['d', 'p', 'q', 'dp', 'dq', 'qi']) {
+              if (privateField in key) throw new Error(`Private JWK field present: ${privateField}`)
+            }
+          }
+          fs.writeFileSync('google-jwks.json', `${JSON.stringify({ keys: source.keys }, null, 2)}\n`)
+          NODE
+      - name: Publish changed keys
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- google-jwks.json; then
+            echo 'Google JWKS is unchanged.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add google-jwks.json
+          git commit -m 'chore: sync Google OIDC JWKS'
+          git push
